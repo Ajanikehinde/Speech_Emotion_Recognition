@@ -1,0 +1,19 @@
+﻿# Jupyter
+.ipynb_checkpoints/
+
+# Temporary notebook inspection files
+inspect_notebook.py
+notebook_review.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local datasets / archives
+data/
+*.zip
