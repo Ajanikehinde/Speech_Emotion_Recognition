@@ -24,8 +24,9 @@ The original implementation was revised to address several methodological issues
 * Lack of cross-validation
 * Lack of per-class precision and recall
 * Use of a machine-specific absolute dataset path
+* No check that evaluation honoured speaker boundaries, which lets the same actors appear in both training and validation data
 
-The revised pipeline addresses these issues while retaining the original project's overall approach.
+The revised pipeline addresses these issues while retaining the original project's overall approach, and adds a **speaker-generalization experiment** that quantifies how much of the reported accuracy depends on that speaker overlap.
 
 ---
 
@@ -47,6 +48,7 @@ The project aims to:
    * Confusion matrix
    * 5-fold stratified cross-validation
 7. Compare model performance with and without feature scaling.
+8. Compare random stratified cross-validation with **actor-grouped** cross-validation, to measure how much speaker overlap inflates the reported accuracy.
 
 ---
 
@@ -282,9 +284,128 @@ The standard deviation represents variation across the five validation folds.
 
 ---
 
+## Speaker-Generalization Evaluation
+
+Stratified splitting preserves the class balance, but it does not preserve **speaker** balance. RAVDESS has only 24 actors, and each actor contributes roughly 32 recordings, so a random fold split almost guarantees that every actor appears in both the training and validation portion. That gives a model the opportunity to exploit speaker-specific cues — vocal tract shape, timbre, recording level — rather than the emotion itself, which is the main reason a random-split accuracy may not transfer to a voice the model has never heard. The experiment below tests for that effect rather than assuming it.
+
+The project therefore evaluates the **same features and the same model** under two different splitting rules. The split rule is the only thing that changes:
+
+```python
+make_model()   # StandardScaler -> MLPClassifier, identical hyperparameters and seed
+
+cross_val_score(make_model(), x, y,
+                cv=StratifiedKFold(6, shuffle=True, random_state=42))
+
+cross_val_score(make_model(), x, y, groups=groups,
+                cv=GroupKFold(n_splits=6))
+```
+
+`groups` is the actor ID parsed from the RAVDESS filename (the last dash-separated field), giving 24 distinct groups.
+
+### Results
+
+| Splitting rule                                   | Mean accuracy | Std. dev. |
+| ------------------------------------------------ | ------------: | --------: |
+| Random stratified 6-fold (speakers overlap)       |    **82.89%** |     2.33% |
+| Actor-grouped 6-fold (speakers disjoint)          |    **54.58%** |     7.91% |
+
+```text
+82.89% - 54.58% = 28.31 percentage points
+```
+
+When no actor appears in the fold that evaluates their own recordings, mean accuracy falls by **28.31 percentage points** — from **82.89% to 54.58%**, about **34%** relative. This should be read as evidence that the random-split figure is **optimistic when actors appear on both sides of a split**, not as a measurement of how much accuracy is caused by speaker identity. The grouping changes more than who has been heard before: it also changes which recordings share a fold and which recording conditions are held out, so the decline cannot be attributed to speaker identity specifically.
+
+Against the four-class random-guess floor of 25%, the grouped result remains well above chance, so the acoustic features do carry emotion information — just not enough to support the higher, speaker-overlapping figure as an estimate of performance on an unseen voice.
+
+### Per-Fold Actor-Grouped Accuracies
+
+Because only 24 actors are available, six folds means **roughly four actors per fold** (approximately 128 recordings per fold) — the exact assignment is decided by `GroupKFold` balancing group sizes, not by a fixed number of actors. That is a small, coarse unit of evaluation, and the fold-to-fold spread is part of the result rather than noise to be averaged away:
+
+| Fold | Accuracy |
+| ---- | -------: |
+| 1    |   56.25% |
+| 2    |   41.41% |
+| 3    |   48.44% |
+| 4    |   66.41% |
+| 5    |   59.06% |
+| 6    |   55.91% |
+| Mean |   54.58% ± 7.91% |
+
+The 25-point range between the best fold (66.41%) and the worst (41.41%) is driven by *which actors* were held out in each fold, which is why the standard deviation (±7.91%) is reported next to the mean rather than the mean alone.
+
+### Held-Out-Actor Test Set
+
+A second, independent check holds out entire actors rather than folds of actors:
+
+```python
+GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42).split(x, y, groups)
+
+assert set(groups[train_idx]).isdisjoint(groups[test_idx])   # no actor in both sets
+```
+
+Six actors were held out — `1, 9, 10, 12, 17, 19` — giving 190 test recordings. Accuracy on that set was **55%** (macro F1 0.54), consistent with the grouped cross-validation estimate.
+
+| Emotion      | Precision |  Recall | F1-score | Support |
+| ------------ | --------: | ------: | -------: | ------: |
+| Calm         |      0.62 |    0.71 |     0.66 |      48 |
+| Disgust      |      0.69 |    0.38 |     0.49 |      47 |
+| Fearful      |      0.48 |    0.66 |     0.56 |      47 |
+| Happy        |      0.47 |    0.44 |     0.45 |      48 |
+| **Macro Avg**|  **0.57** |**0.55** | **0.54** | **190** |
+
+Confusion matrix (rows = actual, columns = predicted, in `observed_emotions` order):
+
+| Actual \\ Predicted | Calm | Happy | Fearful | Disgust |
+| -------------------- | ---: | ----: | ------: | ------: |
+| **Calm**              |   34 |     9 |       4 |       1 |
+| **Happy**             |    6 |    21 |      18 |       3 |
+| **Fearful**           |    6 |     6 |      31 |       4 |
+| **Disgust**           |    9 |     9 |      11 |      18 |
+
+### Class-Level Effect of Removing Speaker Overlap
+
+Comparing the per-class F1 scores with the speaker-overlapping test set is more informative than the accuracy drop alone:
+
+| Emotion | F1, speakers overlap | F1, speakers unseen | Change |
+| ------- | -------------------: | ------------------: | -----: |
+| Calm    |                 0.85 |                0.66 |  −0.19 |
+| Disgust |                 0.76 |                0.49 |  −0.27 |
+| Fearful |                 0.72 |                0.56 |  −0.16 |
+| Happy   |                 0.62 |                0.45 |  −0.17 |
+
+Every class degrades, and the ordering changes: **disgust** falls furthest (−0.27), from the second-strongest class to the second-weakest, and its recall collapses to 0.38 — 11 of its 47 recordings are predicted as `fearful` and 9 as `calm`. **Calm** remains the strongest class under both protocols, so that result is not an artefact of speaker overlap.
+
+The `happy` → `fearful` confusion identified in the confusion matrix above persists with unseen speakers (18 of 48, 37.5%), which makes it the one error pattern that survives the stricter evaluation. That is the pair a future iteration should target.
+
+### Leakage Controls
+
+The comparison is only meaningful if the surrounding preprocessing does not leak. Three controls are in place:
+
+1. **Scaling is fitted inside each fold.** The model is a `make_pipeline(StandardScaler(), MLPClassifier(...))`, so the scaler is refitted on each fold's training portion and only ever *applied* to the held-out portion. No validation statistics reach the scaler.
+2. **Actor groups are disjoint by construction and by assertion.** `GroupKFold` never splits an actor across folds, and the held-out split is verified with `isdisjoint` before it is scored.
+3. **Nothing else differs between the two arms.** Same 180-dimensional feature vectors, same hyperparameters, same `random_state`; only the splitting rule changes, so any difference between the two figures is associated with the split rather than with a change in features, model or tuning.
+
+### What the Gap Does and Does Not Show
+
+The 28-point gap is best described as **evidence of optimistic random-split evaluation under actor overlap**. It is not a causal decomposition and it is not a significance test. In particular:
+
+* **No significance test was performed.** Both arms score the same 766 recordings and differ only in how folds are formed, so the comparison is descriptive. The `±` values quoted above are fold-to-fold standard deviations, not standard errors; no p-value or confidence interval is reported, and nothing here should be read as establishing that the difference is statistically significant.
+* **The gap does not measure the speaker effect.** Grouping by actor also changes fold composition, per-fold class balance and which recording conditions are held out, so the decline cannot be attributed to speaker identity alone.
+* **Speaker identity is confounded with actor-correlated nuisance factors.** Each actor was recorded in one session with one microphone, so "unseen speaker" also means "unseen channel and session". Some of the drop may be acoustic-domain shift rather than speaker physiology.
+* **Six folds over 24 actors is coarse.** Roughly four actors per fold, one `GroupShuffleSplit` draw, no confidence interval on the 55% held-out figure. The ±7.91% spread is a better guide to uncertainty than the mean.
+* **`GroupKFold` is deterministic and non-shuffled, but its folds are not simply sequential actor IDs.** The splitter assigns groups by balancing the number of samples per fold, so the same data always produces the same actor-disjoint folds — but the composition follows that balancing rule rather than ascending actor order, and it is not randomised. Repeatedly re-drawing the grouping would separate "which actors" from "how many actors".
+* **The grouped folds are not stratified.** Class counts per fold vary slightly (47 vs 48 in the held-out set), so a small part of the fold variance is class balance rather than speaker difficulty.
+* **One model, one feature set, one seed.** This measures the sensitivity of *this* pipeline to the splitting rule; it does not establish that 54.58% is the generalization ceiling for speech emotion recognition on RAVDESS.
+
+The defensible claim is therefore narrow: **for this four-class RAVDESS subset, with these features and this MLP, the random stratified figure of 82.89% is optimistic — actors appear on both sides of every split — and when actors are held out, mean accuracy falls to 54.58%.** The experiment establishes the direction and rough size of that evaluation gap. It does not isolate speaker identity as the cause of the decline, and it does not show that the gap is statistically significant.
+
+---
+
 ## Held-Out Test Results
 
 After training the final MLP on the scaled training data, performance was evaluated on the held-out test set.
+
+> **Reading these numbers correctly:** this section uses the random, stratified 75/25 split from *Data Splitting*, so the same actors appear in both the training and test halves. It measures generalisation to unseen **recordings**, not unseen **speakers**. The actor-disjoint result is in *Speaker-Generalization Evaluation* above and is substantially lower.
 
 ### Overall Accuracy
 
@@ -330,7 +451,7 @@ Running that cell produces the following breakdown (actual class in rows, predic
 | **Fearful**            |    1 |     6 |      39 |       2 |
 | **Disgust**            |    6 |     6 |       3 |      33 |
 
-**The dominant error is `happy` being misclassified as `fearful`: 16 of 48 `happy` test samples (33%) were predicted as `fearful` — by a wide margin the single largest off-diagonal count anywhere in the matrix.** This is the direct cause of `happy`'s low recall (0.58) in the classification report above; its precision (0.67) is comparatively less affected because the confusion runs mostly one-directional (only 2 `fearful` samples were mistaken for `happy`). Every other class is confused with its neighbours far less often (at most 6 samples in any other off-diagonal cell), so this specific `happy` → `fearful` boundary is where the model struggles most, and would be the natural place to focus future feature engineering or additional training data.
+**The dominant error is `happy` being misclassified as `fearful`: 16 of 48 `happy` test samples (33%) were predicted as `fearful` — by a wide margin the single largest off-diagonal count anywhere in the matrix.** This is the direct cause of `happy`'s low recall (0.58) in the classification report above; its precision (0.67) is comparatively less affected because the confusion runs mostly one-directional (6 `fearful` samples were mistaken for `happy`, under half as many). Every other class is confused with its neighbours far less often (at most 6 samples in any other off-diagonal cell), so this specific `happy` → `fearful` boundary is where the model struggles most, and would be the natural place to focus future feature engineering or additional training data.
 
 ---
 
@@ -375,13 +496,17 @@ MLP Classifier
       │
       ├── Scaling comparison
       ├── 5-Fold Cross-Validation
-      └── Held-Out Test Evaluation
+      ├── Held-Out Test Evaluation
+      └── Random vs. Actor-Grouped 6-Fold CV
       │
       ▼
 Accuracy / Precision / Recall / F1
       │
       ▼
 Confusion Matrix
+      │
+      ▼
+Speaker-Generalization Gap
 ```
 
 ---
@@ -405,6 +530,10 @@ Confusion Matrix
 * `StandardScaler`
 * `MLPClassifier`
 * `StratifiedKFold`
+* `GroupKFold`
+* `GroupShuffleSplit`
+* `cross_val_score`
+* `make_pipeline`
 * `train_test_split`
 * `classification_report`
 * `confusion_matrix`
@@ -528,7 +657,15 @@ The project uses 22,050 Hz as the target sample rate. This is a practical prepro
 
 ### Class-Level Weakness
 
-The `happy` class is the current model's weakest point (0.62 F1), specifically because of confusion with `fearful` (see Confusion Matrix above). Any future iteration should treat this pair as the priority, rather than treating overall accuracy as the only signal of progress.
+The `happy` class is the current model's weakest point (0.62 F1), specifically because of confusion with `fearful` (see Confusion Matrix above). That weakness is not an artefact of speaker overlap: with actors held out entirely, `happy` still scores 0.45 F1 and still sends 18 of 48 recordings to `fearful`. Any future iteration should treat this pair as the priority, rather than treating overall accuracy as the only signal of progress.
+
+### Speaker Overlap in the Default Protocol
+
+The headline 73.96% held-out accuracy, and the 80.14% mean 5-fold CV accuracy, both come from splits in which the same actors appear in the training and evaluation data. Under actor-grouped evaluation the same pipeline scores 54.58%. The higher numbers are not wrong, but they answer a different question — "can the model recognise a new recording from a familiar voice?" — and should not be read as evidence of generalization to new speakers.
+
+### Small Actor Pool
+
+Only 24 actors are available, so actor-grouped six-fold CV holds out roughly four actors per fold and the single held-out-actor test set uses 6 actors (190 recordings). Fold accuracies range from 41.41% to 66.41% (±7.91%), and the held-out figure is one draw with no confidence interval. The grouped results are therefore directional evidence of an evaluation gap, not a precise estimate of speaker-independent accuracy and not a significance test.
 
 ### Dataset Availability
 
@@ -553,8 +690,9 @@ Potential improvements include:
   * Tonnetz
 * Compare traditional machine-learning approaches with CNN or RNN architectures.
 * Apply data augmentation to increase training diversity.
-* Investigate speaker-independent evaluation strategies.
-* Use additional speech-emotion datasets to assess generalisation.
+* Train and tune under a speaker-disjoint protocol by default, rather than treating it as a secondary check.
+* Report repeated grouped cross-validation with shuffled actor assignment, so the speaker effect is separated from fold composition.
+* Use additional speech-emotion datasets to assess generalisation across corpora and recording conditions.
 * Package the trained model into an inference application or API.
 
 ---
@@ -576,11 +714,15 @@ Audio
 The recorded experiment achieved:
 
 ```text
-73.96% held-out test accuracy
-80.14% mean 5-fold CV accuracy
+73.96% held-out test accuracy          (speakers overlap train/test)
+80.14% mean 5-fold CV accuracy          (speakers overlap across folds)
+82.89% mean 6-fold CV accuracy          (random stratified, speakers overlap)
+54.58% mean 6-fold CV accuracy          (actor-grouped, speakers disjoint)
 ```
 
-A direct comparison also showed that the scaled-feature pipeline substantially outperformed the same MLP using unscaled features on the recorded test split, and the confusion matrix shows that remaining errors are concentrated almost entirely in one direction: `happy` being mistaken for `fearful`.
+The central finding is the difference between the last two lines. Under the same features and the same MLP, changing only the splitting rule so that no speaker appears in both training and evaluation data drops mean accuracy from **82.89% to 54.58%** — a 28.31-point gap. The model is still well above the 25% random-guess floor, so the acoustic features carry real emotion signal. What the gap establishes is that the speaker-overlapping figure is **optimistic — it cannot be read as performance on an unseen voice**. It does not establish how much of the decline is due to speaker identity specifically (the grouping also changes fold composition and recording conditions), and no significance test is reported.
+
+A direct comparison also showed that the scaled-feature pipeline substantially outperformed the same MLP using unscaled features on the recorded test split. The `happy` → `fearful` confusion is the one error pattern that survives the stricter evaluation, appearing under both splitting rules.
 
 These results should be interpreted specifically for the **four-class RAVDESS subset and the documented experimental setup**, rather than as a general benchmark for speech emotion recognition.
 
